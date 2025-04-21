@@ -202,7 +202,7 @@
   <script src="/socket.io/socket.io.js"></script>
   <script>
     // 连接Socket.IO
-    const socket = io();
+    const socket = io('/diesel'); // 连接到/diesel命名空间
     
     // DOM元素
     const mintEventsList = document.getElementById('mintEventsList');
@@ -229,13 +229,80 @@
     let mempoolHighestGasInfo = null;
     
     // 控制按钮事件
+    // 恢复按钮功能
     startBtn.addEventListener('click', () => {
-      socket.emit('control', 'start-diesel');
+      fetch('/api/diesel/control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'start' })
+      })
+      .then(response => response.json())
+      .then(data => {
+        if (data.success) {
+          updateStatusUI('running', data.blockHeight);
+          // 更新按钮状态
+          startBtn.disabled = true;
+          stopBtn.disabled = false;
+        }
+      })
+      .catch(error => console.error('启动失败:', error));
     });
     
     stopBtn.addEventListener('click', () => {
-      socket.emit('control', 'stop-diesel');
+      fetch('/api/diesel/control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'stop' })
+      })
+      .then(response => response.json())
+      .then(data => {
+        if (data.success) {
+          updateStatusUI('stopped', data.blockHeight);
+          // 更新按钮状态
+          startBtn.disabled = false;
+          stopBtn.disabled = true;
+        }
+      })
+      .catch(error => console.error('停止失败:', error));
     });
+    
+    // 请求启动状态
+    function fetchStatus() {
+      fetch('/api/diesel/status')
+        .then(response => response.json())
+        .then(data => {
+          updateStatusUI(data.running ? 'running' : 'stopped', data.blockHeight);
+          
+          // 更新交易列表
+          if (data.recentTransactions && data.recentTransactions.length > 0) {
+            mintEvents = data.recentTransactions;
+            updateMintEventsList();
+          }
+          
+          if (data.pendingTransactions && data.pendingTransactions.length > 0) {
+            mempoolEvents = data.pendingTransactions;
+            updateMempoolEventsList();
+            updateMempoolCount(data.pendingTransactions.length);
+          }
+        })
+        .catch(error => console.error('获取状态失败:', error));
+    }
+    
+    // 获取最高费率
+    function fetchHighestGas() {
+      fetch('/api/diesel/highest-gas')
+        .then(response => response.json())
+        .then(data => {
+          if (data && data.txid) {
+            updateMempoolHighestGas({
+              txid: data.txid,
+              feeRate: parseFloat(data.feeRate) || 0,
+              timestamp: Date.now()
+            });
+          }
+        })
+        .catch(error => console.error('获取最高费率失败:', error));
+    }
     
     // 更新状态UI
     function updateStatusUI(status, height) {
@@ -244,11 +311,13 @@
       if (status === 'running') {
         statusBadge.textContent = '运行中';
         statusBadge.className = 'status-badge badge bg-success';
+        // 更新按钮状态
         startBtn.disabled = true;
         stopBtn.disabled = false;
       } else {
         statusBadge.textContent = '已停止';
         statusBadge.className = 'status-badge badge bg-danger';
+        // 更新按钮状态
         startBtn.disabled = false;
         stopBtn.disabled = true;
       }
@@ -436,23 +505,33 @@
     
     // Socket.IO事件监听
     socket.on('init', (data) => {
-      updateStatusUI(data.dieselStatus, data.currentBlockHeight);
-      mintEvents = data.dieselMintEvents || [];
+      // 新的初始化数据格式
+      updateStatusUI(data.running ? 'running' : 'stopped', data.blockHeight);
+      mintEvents = data.recentTransactions || [];
       updateMintEventsList();
       
-      highestGas = data.dieselHighestGas;
+      // 获取最高费率信息
+      highestGas = data.highestGasRate;
       updateHighestGasInfo(highestGas);
       
-      mempoolHighestGasInfo = data.dieselMempoolHighestGas;
+      // 更新内存池中的交易
+      mempoolEvents = data.pendingTransactions || [];
+      updateMempoolEventsList();
+      updateMempoolCount(mempoolEvents.length);
+      
+      // 更新内存池最高费率
+      mempoolHighestGasInfo = data.highestGasRate;
       updateMempoolHighestGas(mempoolHighestGasInfo);
     });
     
-    socket.on('status', (data) => {
-      updateStatusUI(data.dieselStatus, data.currentBlockHeight);
+    // 区块更新事件
+    socket.on('block-update', (data) => {
+      updateStatusUI('running', data.blockHeight);
+      // 如果有铸造交易，可以在这里处理
     });
     
     // 监听新的DIESEL铸造交易
-    socket.on('diesel-mint', (event) => {
+    socket.on('new-mint', (event) => {
       // 避免重复
       const existingIndex = mintEvents.findIndex(e => e.txid === event.txid);
       if (existingIndex !== -1) {
@@ -475,47 +554,23 @@
     });
     
     // 监听最高Gas费率更新
-    socket.on('diesel-highest-gas', (info) => {
+    socket.on('highest-gas-updated', (info) => {
       highestGas = info;
       updateHighestGasInfo(info);
     });
     
     // 监听Mempool更新
-    socket.on('diesel-mempool', (info) => {
+    socket.on('mempool-update', (info) => {
       updateMempoolCount(info.count);
       
-      if (info.highestFeeRate > 0) {
-        const highestGasInfo = {
-          txid: info.highestFeeTxid,
-          feeRate: info.highestFeeRate,
+      if (info.highest && info.highest.txid) {
+        mempoolHighestGasInfo = {
+          txid: info.highest.txid,
+          feeRate: parseFloat(info.highest.feeRate) || 0,
           timestamp: Date.now()
         };
-        
-        mempoolHighestGasInfo = highestGasInfo;
-        updateMempoolHighestGas(highestGasInfo);
+        updateMempoolHighestGas(mempoolHighestGasInfo);
       }
-    });
-    
-    // 处理Mempool中的铸造交易
-    socket.on('diesel-mempool-tx', (tx) => {
-      // 避免重复
-      const existingIndex = mempoolEvents.findIndex(e => e.txid === tx.txid);
-      if (existingIndex !== -1) {
-        mempoolEvents[existingIndex] = tx;
-      } else {
-        mempoolEvents.push(tx);
-        
-        // 添加到列表顶部
-        const item = createMempoolEventItem(tx, true);
-        if (mempoolEventsList.firstChild) {
-          mempoolEventsList.insertBefore(item, mempoolEventsList.firstChild);
-        } else {
-          mempoolEventsList.appendChild(item);
-          noMempoolEvents.style.display = 'none';
-        }
-      }
-      
-      updateMempoolEventsList();
     });
     
     // 监听赢得DIESEL的交易
@@ -550,25 +605,13 @@
         Notification.requestPermission();
       }
       
-      // 请求初始数据
-      fetch('/api/diesel/mint-events')
-        .then(response => response.json())
-        .then(data => {
-          mintEvents = data;
-          updateMintEventsList();
-        });
+      // 使用新API获取状态数据
+      fetchStatus();
+      fetchHighestGas();
       
-      fetch('/api/diesel/mempool')
-        .then(response => response.json())
-        .then(data => {
-          mempoolEvents = data.transactions || [];
-          updateMempoolEventsList();
-          
-          if (data.highestGas) {
-            mempoolHighestGasInfo = data.highestGas;
-            updateMempoolHighestGas(data.highestGas);
-          }
-        });
+      // 定时刷新数据，确保即使没有Socket连接也能更新
+      setInterval(fetchStatus, 30000);
+      setInterval(fetchHighestGas, 30000);
     });
   </script>
 </body>

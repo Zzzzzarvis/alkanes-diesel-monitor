@@ -1,20 +1,25 @@
 const express = require('express');
-const http = require('http');
-const socketIo = require('socket.io');
 const path = require('path');
 const config = require('../config');
 const logger = require('../utils/logger');
 const alkanesMonitor = require('./alkanesMonitor');
-const dieselMonitor = require('./dieselMonitor');
 
 class WebService {
-  constructor() {
-    this.app = express();
-    this.server = http.createServer(this.app);
-    this.io = socketIo(this.server);
+  constructor(dieselMonitor, app, io) {
+    this.app = app || express();
+    this.io = io;
     this.port = config.server.port;
+    this.dieselMonitor = dieselMonitor; // 接收作为参数传入的实例
+    this.alkanesMonitor = alkanesMonitor;
+    
+    // 添加中间件，用于解析JSON请求体
+    this.app.use(express.json());
+    
     this.setupRoutes();
-    this.setupSocketIO();
+    // 只有当dieselMonitor实例存在且io存在时才设置SocketIO
+    if (this.dieselMonitor && this.io) {
+      this.setupSocketIO();
+    }
   }
 
   /**
@@ -30,7 +35,7 @@ class WebService {
         status: alkanesMonitor.isRunning ? 'running' : 'stopped',
         currentBlockHeight: alkanesMonitor.currentBlockHeight,
         mintEventsCount: alkanesMonitor.mintEvents.length,
-        dieselStatus: dieselMonitor.isRunning ? 'running' : 'stopped'
+        dieselStatus: this.dieselMonitor && this.dieselMonitor.isRunning ? 'running' : 'stopped'
       });
     });
 
@@ -39,28 +44,100 @@ class WebService {
       res.json(alkanesMonitor.getLatestMintEvents(limit));
     });
 
-    // DIESEL专用API
-    this.app.get('/api/diesel/status', (req, res) => {
-      res.json({
-        status: dieselMonitor.isRunning ? 'running' : 'stopped',
-        currentBlockHeight: dieselMonitor.currentBlockHeight,
-        highestGasRate: dieselMonitor.getHighestGasRate(),
-        mempoolHighestGas: dieselMonitor.getMempoolHighestGasRate(),
-        pendingTransactionsCount: dieselMonitor.getPendingMintTransactions().length
+    // 确保dieselMonitor存在才提供相关API
+    if (this.dieselMonitor) {
+      // DIESEL专用API
+      this.app.get('/api/diesel/status', (req, res) => {
+        const blockHeight = this.dieselMonitor.lastScannedHeight || 0;
+        const running = this.dieselMonitor.isRunning;
+        
+        const recentTxs = this.dieselMonitor.getRecentMintTransactions(10);
+        const formattedRecentTxs = recentTxs.map(tx => ({
+          ...tx,
+          feeRate: typeof tx.feeRate === 'number' ? tx.feeRate.toFixed(2) : '0.00'
+        }));
+        
+        const pendingTxs = this.dieselMonitor.getPendingMintTransactions();
+        const formattedPendingTxs = pendingTxs.map(tx => ({
+          ...tx,
+          feeRate: typeof tx.feeRate === 'number' ? tx.feeRate.toFixed(2) : '0.00'
+        }));
+        
+        res.json({
+          blockHeight,
+          running,
+          recentTransactions: formattedRecentTxs,
+          pendingTransactions: formattedPendingTxs
+        });
       });
-    });
 
-    this.app.get('/api/diesel/mint-events', (req, res) => {
-      const limit = parseInt(req.query.limit) || 10;
-      res.json(dieselMonitor.getRecentMintTransactions(limit));
-    });
-
-    this.app.get('/api/diesel/mempool', (req, res) => {
-      res.json({
-        transactions: dieselMonitor.getPendingMintTransactions(),
-        highestGas: dieselMonitor.getMempoolHighestGasRate()
+      this.app.get('/api/diesel/highest-gas', (req, res) => {
+        const highestData = this.dieselMonitor.getMempoolHighestGasRate();
+        
+        const highest = highestData ? {
+          txid: highestData.txid,
+          feeRate: typeof highestData.feeRate === 'number' ? highestData.feeRate.toFixed(2) : '0.00'
+        } : { txid: null, feeRate: '0.00' };
+        
+        res.json(highest);
       });
-    });
+
+      // 获取当前内存池中费率大于50 sat/vB且包含OP_RETURN输出的交易
+      this.app.get('/api/diesel/high-gas-op-return', async (req, res) => {
+        try {
+          const transactions = await this.dieselMonitor.getHighGasOpReturnTransactions();
+          
+          // 格式化交易列表，只返回必要的信息
+          const formattedTransactions = transactions.map(tx => ({
+            txid: tx.txid,
+            feeRate: typeof tx.feeRate === 'number' ? tx.feeRate.toFixed(2) : '0.00'
+          }));
+          
+          res.json({
+            count: formattedTransactions.length,
+            transactions: formattedTransactions
+          });
+        } catch (error) {
+          logger.error(`获取高费率OP_RETURN交易失败: ${error.message}`);
+          res.status(500).json({
+            success: false,
+            message: '获取交易失败'
+          });
+        }
+      });
+
+      // 控制启动和停止
+      this.app.post('/api/diesel/control', (req, res) => {
+        const action = req.body?.action;
+        
+        if (action === 'start') {
+          if (!this.dieselMonitor.isRunning) {
+            this.dieselMonitor.start();
+            logger.info('通过API启动DIESEL监控');
+          }
+          res.json({
+            success: true,
+            running: true,
+            blockHeight: this.dieselMonitor.lastScannedHeight || 0
+          });
+        } else if (action === 'stop') {
+          if (this.dieselMonitor.isRunning) {
+            this.dieselMonitor.stop();
+            logger.info('通过API停止DIESEL监控');
+          }
+          res.json({
+            success: true,
+            running: false,
+            blockHeight: this.dieselMonitor.lastScannedHeight || 0
+          });
+        } else {
+          res.status(400).json({
+            success: false,
+            message: '无效的操作'
+          });
+        }
+      });
+    }
 
     // 主页路由
     this.app.get('/', (req, res) => {
@@ -77,76 +154,126 @@ class WebService {
    * 设置Socket.IO
    */
   setupSocketIO() {
-    this.io.on('connection', (socket) => {
+    if (!this.dieselMonitor || !this.io) {
+      logger.warn('设置SocketIO失败: dieselMonitor实例或io不存在');
+      return;
+    }
+
+    const dieselNamespace = this.io.of('/diesel');
+    
+    dieselNamespace.on('connection', (socket) => {
       logger.info(`新客户端连接: ${socket.id}`);
-
-      // 当新客户端连接时，发送最新数据
-      socket.emit('init', {
-        status: alkanesMonitor.isRunning ? 'running' : 'stopped',
-        currentBlockHeight: alkanesMonitor.currentBlockHeight,
-        mintEvents: alkanesMonitor.getLatestMintEvents(50),
-        dieselStatus: dieselMonitor.isRunning ? 'running' : 'stopped',
-        dieselHighestGas: dieselMonitor.getHighestGasRate(),
-        dieselMempoolHighestGas: dieselMonitor.getMempoolHighestGasRate()
+      
+      this.sendInitialStatus(socket);
+      
+      socket.on('disconnect', () => {
+        logger.debug(`客户端断开连接: ${socket.id}`);
       });
+    });
 
-      // 监听控制命令
-      socket.on('control', (command) => {
-        if (command === 'start') {
-          alkanesMonitor.start();
-        } else if (command === 'stop') {
-          alkanesMonitor.stop();
-        } else if (command === 'start-diesel') {
-          dieselMonitor.start();
-        } else if (command === 'stop-diesel') {
-          dieselMonitor.stop();
-        }
+    // 确保dieselMonitor是一个有效的EventEmitter实例    
+    if (this.dieselMonitor && typeof this.dieselMonitor.on === 'function') {
+      // 监听区块扫描事件
+      this.dieselMonitor.on('block-scanned', (data) => {
+        dieselNamespace.emit('block-update', {
+          blockHeight: data.height,
+          blockHash: data.hash,
+          mintTxCount: data.mintTxCount
+        });
+      });
+      
+      // 监听新铸造事件
+      this.dieselMonitor.on('new-mint', (tx) => {
+        const formattedTx = {
+          ...tx,
+          feeRate: typeof tx.feeRate === 'number' ? tx.feeRate.toFixed(2) : '0.00'
+        };
+        dieselNamespace.emit('new-mint', formattedTx);
+      });
+      
+      // 监听内存池更新事件
+      this.dieselMonitor.on('mempool-update', (data) => {
+        const highestData = this.dieselMonitor.getMempoolHighestGasRate();
         
-        // 发送状态更新
-        this.io.emit('status', {
-          status: alkanesMonitor.isRunning ? 'running' : 'stopped',
-          currentBlockHeight: alkanesMonitor.currentBlockHeight,
-          dieselStatus: dieselMonitor.isRunning ? 'running' : 'stopped'
+        const highest = highestData ? {
+          txid: highestData.txid,
+          feeRate: typeof highestData.feeRate === 'number' ? highestData.feeRate.toFixed(2) : '0.00'
+        } : { txid: null, feeRate: '0.00' };
+        
+        dieselNamespace.emit('mempool-update', {
+          count: data.count,
+          highest
         });
       });
 
-      // 监听断开连接
-      socket.on('disconnect', () => {
-        logger.info(`客户端断开连接: ${socket.id}`);
+      // 监听DIESEL特定事件
+      this.dieselMonitor.on('highest-gas-updated', (gasInfo) => {
+        this.io.emit('diesel-highest-gas', gasInfo);
       });
-    });
+
+      this.dieselMonitor.on('diesel-won', (transaction) => {
+        this.io.emit('diesel-won', transaction);
+      });
+    }
 
     // 监听铸造事件，并通过WebSocket广播
-    alkanesMonitor.on('mint', (mintEvent) => {
-      this.io.emit('mint', mintEvent);
-    });
+    if (alkanesMonitor && typeof alkanesMonitor.on === 'function') {
+      alkanesMonitor.on('mint', (mintEvent) => {
+        this.io.emit('mint', mintEvent);
+      });
+    }
+  }
 
-    // 监听DIESEL特定事件
-    dieselMonitor.on('new-mint', (mintEvent) => {
-      this.io.emit('diesel-mint', mintEvent);
-    });
-
-    dieselMonitor.on('highest-gas-updated', (gasInfo) => {
-      this.io.emit('diesel-highest-gas', gasInfo);
-    });
-
-    dieselMonitor.on('diesel-won', (transaction) => {
-      this.io.emit('diesel-won', transaction);
-    });
-
-    dieselMonitor.on('mempool-update', (mempoolInfo) => {
-      this.io.emit('diesel-mempool', mempoolInfo);
-    });
+  // 向新连接的客户端发送初始状态
+  sendInitialStatus(socket) {
+    try {
+      if (!this.dieselMonitor) return;
+      
+      const blockHeight = this.dieselMonitor.lastScannedHeight || 0;
+      const running = this.dieselMonitor.isRunning;
+      
+      // 获取最近的交易历史
+      const recentTxs = this.dieselMonitor.getRecentMintTransactions(10);
+      const formattedRecentTxs = recentTxs.map(tx => ({
+        ...tx,
+        feeRate: typeof tx.feeRate === 'number' ? tx.feeRate.toFixed(2) : '0.00'
+      }));
+      
+      // 获取内存池中的DIESEL铸造交易
+      const pendingTxs = this.dieselMonitor.getPendingMintTransactions();
+      const formattedPendingTxs = pendingTxs.map(tx => ({
+        ...tx,
+        feeRate: typeof tx.feeRate === 'number' ? tx.feeRate.toFixed(2) : '0.00'
+      }));
+      
+      // 获取最高费率交易
+      const highestData = this.dieselMonitor.getMempoolHighestGasRate();
+      const highest = highestData ? {
+        txid: highestData.txid,
+        feeRate: typeof highestData.feeRate === 'number' ? highestData.feeRate.toFixed(2) : '0.00'
+      } : { txid: null, feeRate: '0.00' };
+      
+      // 发送初始状态
+      socket.emit('init', {
+        blockHeight,
+        running,
+        recentTransactions: formattedRecentTxs,
+        pendingTransactions: formattedPendingTxs,
+        highestGasRate: highest
+      });
+    } catch (error) {
+      logger.error(`发送初始状态失败: ${error.message}`);
+    }
   }
 
   /**
    * 启动Web服务
+   * 方法保留用于向后兼容
    */
   start() {
-    this.server.listen(this.port, () => {
-      logger.info(`Web服务已启动，监听端口: ${this.port}`);
-    });
+    logger.info(`Web服务已初始化并启动`);
   }
 }
 
-module.exports = new WebService(); 
+// 导出类，而不是实例
+module.exports = WebService; 

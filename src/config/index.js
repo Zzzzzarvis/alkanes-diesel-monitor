@@ -1,4 +1,5 @@
 require('dotenv').config();
+const path = require('path');
 
 // 解析命令行参数
 const argv = require('minimist')(process.argv.slice(2));
@@ -28,7 +29,14 @@ module.exports = {
     port: process.env.PORT || 3000
   },
   log: {
-    level: process.env.LOG_LEVEL || 'info'
+    level: process.env.LOG_LEVEL || 'debug',
+    filename: path.join(__dirname, '..', '..', 'logs', 'app.log'),
+    handleExceptions: true,
+    json: false,
+    maxsize: 5242880, // 5MB
+    maxFiles: 5,
+    colorize: false,
+    timestamp: true
   },
   // Alkanes协议相关配置
   alkanes: {
