@@ -23,6 +23,12 @@ class DieselMonitor extends EventEmitter {
       feeRate: 0,
       timestamp: null
     };
+
+    // 记录已处理的交易，避免重复处理
+    this.processedTxids = new Set();
+    
+    // 记录最后一次扫描的时间戳
+    this.lastScanTime = 0;
   }
 
   /**
@@ -38,7 +44,15 @@ class DieselMonitor extends EventEmitter {
     this.isRunning = true;
 
     try {
-      // 获取起始区块高度
+      // 如果指定了区块高度，只分析该区块
+      if (config.blockAnalysis.targetHeight !== null) {
+        logger.info(`将分析区块高度: ${config.blockAnalysis.targetHeight}`);
+        await this.analyzeSpecificBlock(config.blockAnalysis.targetHeight);
+        this.isRunning = false;
+        return;
+      }
+
+      // 正常监控模式
       if (config.alkanes.startBlockHeight === 'latest') {
         this.currentBlockHeight = await bitcoinRPC.getBlockCount();
         logger.info(`从最新区块开始监控: ${this.currentBlockHeight}`);
@@ -95,6 +109,10 @@ class DieselMonitor extends EventEmitter {
       for (let height = this.currentBlockHeight + 1; height <= latestBlockHeight; height++) {
         await this.processBlock(height);
         this.currentBlockHeight = height;
+        
+        // 新区块生成时，只清理mempool中的交易，不重置最高费率记录
+        this.pendingMintTransactions.clear();
+        this.processedTxids.clear();
       }
     } catch (error) {
       logger.error(`扫描新区块失败: ${error.message}`);
@@ -129,6 +147,12 @@ class DieselMonitor extends EventEmitter {
           // 计算交易的fee rate (sat/vB)
           const feeRate = this.calculateFeeRate(tx);
           
+          // 如果费率计算失败，跳过这笔交易
+          if (feeRate === null) {
+            logger.info(`发现DIESEL铸造交易: ${tx.txid} 在区块 #${height}, 费率: 无效`);
+            continue;
+          }
+          
           // 保存交易信息
           const mintInfo = {
             txid: tx.txid,
@@ -150,7 +174,7 @@ class DieselMonitor extends EventEmitter {
           // 记录交易信息
           this.addDieselMintTransaction(mintInfo);
           
-          logger.info(`发现DIESEL铸造交易: ${tx.txid} 在区块 #${height}, 费率: ${feeRate} sat/vB`);
+          logger.info(`发现DIESEL铸造交易: ${tx.txid} 在区块 #${height}, 费率: ${feeRate.toFixed(2)} sat/vB`);
         }
       }
       
@@ -165,8 +189,8 @@ class DieselMonitor extends EventEmitter {
           // 发出赢得DIESEL的事件
           this.emit('diesel-won', winningTransaction);
           
-          // 如果费率创历史新高，更新最高记录 (忽略费率为0或极低的交易)
-          if (winningTransaction.feeRate > 1 && winningTransaction.feeRate > this.highestGasRate.feeRate) {
+          // 如果费率创历史新高，更新最高记录
+          if (winningTransaction.feeRate > this.highestGasRate.feeRate) {
             this.highestGasRate = {
               txid: winningTransaction.txid,
               feeRate: winningTransaction.feeRate,
@@ -241,159 +265,149 @@ class DieselMonitor extends EventEmitter {
    */
   async scanMempool() {
     try {
-      // 获取内存池交易列表（轻量级模式）
-      const mempool = await bitcoinRPC.getRawMempool(true);
-      
-      // 当前mempool中的最高费率
-      let highestFeeRate = 0;
-      let highestFeeTxid = null;
-      
-      // 清理已经不在mempool中的交易
-      this.cleanupMempoolTransactions(Object.keys(mempool));
-      
-      // 获取所有交易ID列表
+      const currentTime = Date.now();
+      let mempool;
+      try {
+        mempool = await bitcoinRPC.getRawMempool(true);
+      } catch (error) {
+        if (error.response && error.response.status === 503) {
+          logger.error(`RPC服务暂时不可用(503): ${error.response.data || '无详细信息'}`);
+        } else {
+          logger.error(`获取Mempool失败: ${error.message}`);
+        }
+        return;
+      }
+
       const allTxids = Object.keys(mempool);
       
-      logger.info(`开始扫描内存池，共 ${allTxids.length} 笔交易`);
+      if (config.debug.enabled) {
+        logger.info(`开始扫描内存池，共 ${allTxids.length} 笔交易`);
+        logger.info(`距离上次扫描: ${((currentTime - this.lastScanTime) / 1000).toFixed(1)}秒`);
+      }
 
       if (allTxids.length === 0) {
-        logger.info('内存池为空，没有交易需要处理');
+        if (config.debug.enabled) {
+          logger.info('内存池为空，没有交易需要处理');
+        }
         return;
       }
       
-      // 降低费率阈值，增加扫描范围以提高查全率
-      const MIN_FEE_RATE = 10; // 降低最低费率阈值，从30降到10 sat/vB
-      
+      const MIN_FEE_RATE = 10;
       const highFeeRateTxs = [];
       
       for (const txid of allTxids) {
-        if (mempool[txid] && mempool[txid].fees && mempool[txid].vsize) {
-          // 费率计算：fees.base是以BTC为单位，需要转换为satoshi
-          const feeRateSats = (mempool[txid].fees.base * 100000000) / (mempool[txid].vsize);
+        if (!this.processedTxids.has(txid) && mempool[txid] && mempool[txid].fees) {
+          const feeRateSats = (mempool[txid].fees.base * 100000000) / (mempool[txid].vsize || mempool[txid].size);
           
-          // 只关注高费率交易，或者用户提供的示例交易
-          const isSampleTx = txid === '79d67e617fbf8f3a3d7cc5b074301c5dc01c15ef43800582fd7cce2c29fd03fe' || 
-                            txid.includes('f214dd03a3c0d');
-          
-          if (feeRateSats >= MIN_FEE_RATE || isSampleTx) {
+          if (feeRateSats >= MIN_FEE_RATE) {
             highFeeRateTxs.push({
               txid,
               feeRate: feeRateSats,
               weight: mempool[txid].weight || mempool[txid].vsize * 4,
-              size: mempool[txid].size || mempool[txid].vsize,
-              isSampleTx: isSampleTx
+              size: mempool[txid].size || mempool[txid].vsize
             });
           }
         }
       }
       
-      logger.info(`内存池中费率大于 ${MIN_FEE_RATE} sat/vB 的交易: ${highFeeRateTxs.length}/${allTxids.length} 笔`);
-      
-      // 先检查是否有用户提供的示例交易ID
-      const sampleTxs = highFeeRateTxs.filter(tx => tx.isSampleTx);
-      if (sampleTxs.length > 0) {
-        logger.info(`发现用户提供的示例交易: ${sampleTxs.map(tx => tx.txid).join(', ')}`);
+      if (config.debug.enabled) {
+        logger.info(`内存池中新的高费率交易(>=${MIN_FEE_RATE} sat/vB): ${highFeeRateTxs.length}笔`);
       }
       
       if (highFeeRateTxs.length === 0) {
-        logger.info('没有高费率交易需要处理');
+        if (config.debug.enabled) {
+          logger.info('没有新的高费率交易需要处理');
+        }
         return;
       }
       
-      // 排序：按费率从高到低，但示例交易优先处理
-      highFeeRateTxs.sort((a, b) => {
-        if (a.isSampleTx && !b.isSampleTx) return -1;
-        if (!a.isSampleTx && b.isSampleTx) return 1;
-        return b.feeRate - a.feeRate;
-      });
+      highFeeRateTxs.sort((a, b) => b.feeRate - a.feeRate);
       
-      // 找出未处理过的交易
-      const unprocessedTxids = highFeeRateTxs
-        .filter(tx => !this.pendingMintTransactions.has(tx.txid))
-        .map(tx => tx.txid);
-      
-      logger.info(`高费率未处理交易: ${unprocessedTxids.length} 笔`);
-      
-      if (unprocessedTxids.length === 0) {
-        logger.info('没有新的高费率交易需要处理');
-        return;
-      }
-      
-      // 批量处理策略优化，确保示例交易先处理
-      const batchSize = 50; // 每批处理的交易数量
+      // 减小批量大小到10个交易
+      const batchSize = 10;
       const txBatches = [];
       
-      // 先处理用户示例交易（如果有）
-      const sampleUnprocessedTxids = unprocessedTxids.filter(txid => 
-        txid === '79d67e617fbf8f3a3d7cc5b074301c5dc01c15ef43800582fd7cce2c29fd03fe' || 
-        txid.includes('f214dd'));
-        
-      if (sampleUnprocessedTxids.length > 0) {
-        txBatches.push(sampleUnprocessedTxids);
-        logger.info(`优先处理示例交易: ${sampleUnprocessedTxids.join(', ')}`);
+      for (let i = 0; i < highFeeRateTxs.length; i += batchSize) {
+        txBatches.push(highFeeRateTxs.slice(i, i + batchSize));
       }
       
-      // 再处理其他交易
-      const otherTxids = unprocessedTxids.filter(txid => !sampleUnprocessedTxids.includes(txid));
-      for (let i = 0; i < otherTxids.length; i += batchSize) {
-        txBatches.push(otherTxids.slice(i, i + batchSize));
+      if (config.debug.enabled) {
+        logger.info(`将${highFeeRateTxs.length}笔交易分成${txBatches.length}批处理`);
       }
       
-      logger.info(`将${unprocessedTxids.length}笔交易分成${txBatches.length}批处理`);
-      
-      // 并行处理所有批次
       const txDetailsMap = new Map();
       
-      await Promise.all(txBatches.map(async (batch, index) => {
-        const batchResults = await bitcoinRPC.getBatchMempoolTransactions(batch, batchSize);
-        for (const [txid, tx] of batchResults.entries()) {
-          txDetailsMap.set(txid, {
-            tx,
-            feeRate: highFeeRateTxs.find(t => t.txid === txid)?.feeRate || 0,
-            isSampleTx: sampleUnprocessedTxids.includes(txid)
-          });
-        }
-        const samplesInBatch = batch.filter(txid => sampleUnprocessedTxids.includes(txid)).length;
-        if (samplesInBatch > 0) {
-          logger.info(`完成示例交易批次处理, 获取了${batchResults.size}/${batch.length}笔交易详情`);
-        } else {
-          logger.debug(`完成第${index+1}/${txBatches.length}批次处理, 获取了${batchResults.size}/${batch.length}笔交易详情`);
-        }
-      }));
+      // 添加延时函数
+      const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
       
-      logger.info(`高效批处理：成功获取${txDetailsMap.size}/${unprocessedTxids.length}笔交易详情`);
-      
-      // 对于样本交易，打印更多细节信息
-      for (const txid of sampleUnprocessedTxids) {
-        if (txDetailsMap.has(txid)) {
-          const tx = txDetailsMap.get(txid).tx;
-          logger.info(`样本交易结构: ${txid}, 输出数量=${tx.vout ? tx.vout.length : 0}`);
-          
-          // 打印交易输出结构
-          if (tx.vout && tx.vout.length > 0) {
-            tx.vout.forEach((vout, idx) => {
-              logger.info(`输出#${idx}: value=${vout.value}, type=${vout.scriptPubKey?.type || 'unknown'}`);
-            });
+      // 处理每个批次，添加重试和延时
+      for (let i = 0; i < txBatches.length; i++) {
+        const batch = txBatches[i];
+        let retryCount = 0;
+        const maxRetries = 3;
+        
+        while (retryCount < maxRetries) {
+          try {
+            const batchResults = await bitcoinRPC.getBatchMempoolTransactions(batch.map(tx => tx.txid));
+            for (const [txid, tx] of batchResults.entries()) {
+              const originalTx = batch.find(t => t.txid === txid);
+              if (originalTx) {
+                txDetailsMap.set(txid, {
+                  tx,
+                  feeRate: originalTx.feeRate
+                });
+              }
+            }
+            // 成功处理后等待100ms再处理下一批
+            await delay(100);
+            break;
+          } catch (error) {
+            retryCount++;
+            if (error.response && error.response.status === 503) {
+              logger.error(`批次${i + 1}处理失败(503): ${error.response.data || '无详细信息'}`);
+            } else if (error.response && error.response.data && error.response.data.error) {
+              // RBF或其他RPC错误
+              const rpcError = error.response.data.error;
+              if (rpcError.code === -5) {
+                logger.warn(`交易 ${batch[0].txid} 可能已被替换(RBF)或不存在`);
+              } else {
+                logger.warn(`批次${i + 1}处理失败: ${rpcError.message}`);
+              }
+            } else {
+              logger.warn(`批次${i + 1}处理失败: ${error.message}`);
+            }
+            
+            if (retryCount === maxRetries) {
+              logger.warn(`批次${i + 1}处理失败，已达到最大重试次数`);
+            } else {
+              // 重试前等待时间随重试次数增加
+              await delay(1000 * retryCount);
+              logger.info(`批次${i + 1}处理失败，第${retryCount}次重试`);
+            }
           }
-        } else {
-          logger.warn(`未能获取样本交易: ${txid}`);
+        }
+        
+        if (config.debug.enabled && (i + 1) % 5 === 0) {
+          logger.debug(`完成第${i + 1}/${txBatches.length}批次处理`);
         }
       }
       
-      // 筛选出包含OP_RETURN的交易
+      if (config.debug.enabled) {
+        logger.info(`高效批处理：成功获取${txDetailsMap.size}/${highFeeRateTxs.length}笔交易详情`);
+      }
+      
       let mintCount = 0;
+      let currentHighestFeeRate = 0;
+      let currentHighestFeeTxid = null;
       
       for (const [txid, data] of txDetailsMap.entries()) {
-        // 先快速检查是否有OP_RETURN
-        if (this.hasOpReturn(data.tx) || data.isSampleTx) {
-          // 再检查是否是DIESEL铸造交易
+        if (this.hasOpReturn(data.tx)) {
           const isDieselMint = this.isDieselMintTransaction(data.tx);
           
           if (isDieselMint) {
             mintCount++;
             const feeRate = data.feeRate;
             
-            // 保存交易信息
             const mintInfo = {
               txid: txid,
               feeRate: feeRate,
@@ -402,35 +416,56 @@ class DieselMonitor extends EventEmitter {
               inMempool: true
             };
             
-            // 添加到pendingMintTransactions
             this.pendingMintTransactions.set(txid, mintInfo);
             
-            // 更新最高费率
-            if (feeRate > highestFeeRate) {
-              highestFeeRate = feeRate;
-              highestFeeTxid = txid;
+            if (feeRate > currentHighestFeeRate) {
+              currentHighestFeeRate = feeRate;
+              currentHighestFeeTxid = txid;
             }
             
-            logger.info(`发现Mempool中的DIESEL铸造交易: ${txid}, 费率: ${feeRate.toFixed(2)} sat/vB`);
-          } else if (data.isSampleTx) {
-            logger.warn(`示例交易未被识别为DIESEL铸造交易: ${txid}`);
+            this.updateHighestGasRate(txid, feeRate, mintInfo.sender);
+            
+            if (config.debug.enabled) {
+              logger.info(`DIESEL铸造交易: ${txid} (费率: ${feeRate.toFixed(2)} sat/vB)`);
+            }
           }
+        }
+        
+        this.processedTxids.add(txid);
+      }
+      
+      const expireTime = currentTime - 24 * 60 * 60 * 1000;
+      for (const txid of this.processedTxids) {
+        if (!mempool[txid] || (this.pendingMintTransactions.get(txid)?.timestamp || 0) < expireTime) {
+          this.processedTxids.delete(txid);
         }
       }
       
-      logger.info(`高效扫描结果: 处理${txDetailsMap.size}笔交易，找到DIESEL铸造交易${mintCount}笔`);
+      // 获取并显示top3交易
+      const top3Transactions = Array.from(this.pendingMintTransactions.values())
+        .sort((a, b) => b.feeRate - a.feeRate)
+        .slice(0, 3);
       
-      // 如果有DIESEL铸造交易在mempool中
+      // 简化的结果输出
+      logger.info(`Mempool扫描结果: ${mintCount}笔DIESEL铸造交易, 最高费率: ${this.highestGasRate.feeRate.toFixed(2)} sat/vB (${this.highestGasRate.txid})`);
+      
+      if (top3Transactions.length > 0) {
+        logger.info('Top 3 DIESEL铸造交易:');
+        top3Transactions.forEach((tx, index) => {
+          logger.info(`${index + 1}. ${tx.txid} - ${tx.feeRate.toFixed(2)} sat/vB`);
+        });
+      }
+      
       if (this.pendingMintTransactions.size > 0) {
-        // 发出mempool更新事件
         this.emit('mempool-update', {
           count: this.pendingMintTransactions.size,
-          highestFeeRate: highestFeeRate,
-          highestFeeTxid: highestFeeTxid
+          highestFeeRate: this.highestGasRate.feeRate,
+          highestFeeTxid: this.highestGasRate.txid,
+          top3Transactions: top3Transactions
         });
-        
-        logger.info(`Mempool中共有 ${this.pendingMintTransactions.size} 笔DIESEL铸造交易, 当前最高费率: ${highestFeeRate.toFixed(2)} sat/vB`);
       }
+      
+      this.lastScanTime = currentTime;
     } catch (error) {
       logger.error(`扫描Mempool失败: ${error.message}`);
     }
@@ -465,7 +500,7 @@ class DieselMonitor extends EventEmitter {
   /**
    * 计算交易的fee rate (sat/vB)
    * @param {Object} tx - 交易对象
-   * @returns {number} - 费率
+   * @returns {number|null} - 费率，如果无法计算则返回null
    */
   calculateFeeRate(tx) {
     try {
@@ -473,36 +508,51 @@ class DieselMonitor extends EventEmitter {
       let inputSum = 0;
       for (const vin of tx.vin) {
         if (vin.prevout && vin.prevout.value) {
-          inputSum += vin.prevout.value;
+          inputSum += Number(vin.prevout.value);
         }
-      }
-      
-      // 如果输入总额为0，可能是coinbase交易或其他特殊情况
-      if (inputSum === 0) {
-        return 0;
       }
       
       // 计算输出总额
       let outputSum = 0;
       for (const vout of tx.vout) {
-        outputSum += vout.value;
+        if (vout.value) {
+          outputSum += Number(vout.value);
+        }
       }
       
       // 交易费 = 输入 - 输出
       const fee = inputSum - outputSum;
       
-      // 如果交易大小不可用，尝试使用weight/4作为vsize的估计
+      // 获取交易大小
       const vsize = tx.vsize || tx.size || (tx.weight ? Math.ceil(tx.weight / 4) : 0);
       
       if (vsize === 0) {
-        return 0;
+        logger.warn(`交易 ${tx.txid} 无法获取大小信息`);
+        return null;
       }
       
       // 计算费率 (sat/vB)
-      return (fee * 100000000) / vsize;
+      const feeRate = (fee * 100000000) / vsize;
+      
+      if (config.debug.enabled) {
+        logger.debug(`交易 ${tx.txid} 费率计算:`);
+        logger.debug(`- 输入总额: ${inputSum} sat`);
+        logger.debug(`- 输出总额: ${outputSum} sat`);
+        logger.debug(`- 交易费: ${fee} sat`);
+        logger.debug(`- 交易大小: ${vsize} vB`);
+        logger.debug(`- 费率: ${feeRate.toFixed(2)} sat/vB`);
+      }
+      
+      // 如果费率为负数或0，返回null表示无法计算
+      if (feeRate <= 0) {
+        logger.warn(`交易 ${tx.txid} 计算出无效费率(${feeRate.toFixed(2)} sat/vB)，将被忽略`);
+        return null;
+      }
+      
+      return feeRate;
     } catch (error) {
       logger.error(`计算交易费率失败: ${error.message}`);
-      return 0;
+      return null;
     }
   }
 
@@ -529,175 +579,46 @@ class DieselMonitor extends EventEmitter {
    */
   isDieselMintTransaction(tx) {
     try {
-      // 先记录基本交易信息便于调试
+      // 记录交易ID用于调试
       const txid = tx.txid || tx.hash || '';
-      const isSampleTx = txid.length > 5 && 
-                        (txid === '79d67e617fbf8f3a3d7cc5b074301c5dc01c15ef43800582fd7cce2c29fd03fe' || 
-                         txid.includes('f214dd'));
       
-      // 如果是用户提供的示例交易，直接识别为DIESEL交易
-      if (isSampleTx) {
-        logger.info(`匹配到用户提供的示例交易: ${txid}`);
-        return true;
-      }
-      
-      // 打印更多交易详情，帮助调试
-      if (isSampleTx && tx.vout && tx.vout.length > 0) {
-        logger.info(`示例交易输出详情: ${JSON.stringify(tx.vout.slice(0, 3))}`);
-      }
-      
-      // 检查是否有OP_RETURN输出 - 使用更灵活的检测
-      let opReturnOutputs = [];
-      
-      if (tx.vout && Array.isArray(tx.vout)) {
-        // 查找所有可能的OP_RETURN输出
-        opReturnOutputs = tx.vout.filter(vout => {
-          // 检查所有可能的OP_RETURN标识
-          return (
-            // 直接类型检查
-            (vout.scriptPubKey?.type === 'nulldata') ||
-            (vout.scriptpubkey_type === 'op_return') ||
-            
-            // ASM内容检查 - 多种可能格式
-            (vout.scriptPubKey?.asm?.startsWith('OP_RETURN')) ||
-            (vout.scriptpubkey_asm?.startsWith('OP_RETURN')) ||
-            
-            // HEX内容检查 - 6a是OP_RETURN的十六进制码
-            (vout.scriptPubKey?.hex?.startsWith('6a')) ||
-            (vout.scriptpubkey?.startsWith('6a')) ||
-            
-            // Mempool格式检查
-            (vout['ScriptPubKey (HEX)']?.startsWith('6a')) ||
-            (vout['ScriptPubKey (ASM)']?.startsWith('OP_RETURN'))
-          );
-        });
-      }
-
-      if (opReturnOutputs.length === 0) {
-        // 记录交易没有OP_RETURN输出
-        if (isSampleTx) {
-          logger.warn(`示例交易没有OP_RETURN输出: ${txid}`);
-        }
+      if (!tx || !tx.vout || !Array.isArray(tx.vout)) {
         return false;
       }
-      
-      // 先检查交易结构: Alkanes DIESEL铸造交易通常包含:
-      // 1. 一个OP_RETURN输出，包含特定数据模式
-      // 2. 一个P2TR输出，值为546聪(最小粉尘值)
-      
-      // 查找P2TR粉尘输出 - 考虑不同的数据格式
-      let hasP2TRDust = false;
-      
-      if (tx.vout && Array.isArray(tx.vout)) {
-        hasP2TRDust = tx.vout.some(out => {
-          // 检测P2TR输出 - 多种可能格式
-          const isP2TR = 
-            // 常规格式
-            (out.scriptPubKey?.hex?.startsWith('5120')) || 
-            (out.scriptPubKey?.type === 'v1_p2tr') ||
-            (out.scriptPubKey?.asm?.startsWith('OP_PUSHNUM_1 OP_PUSHBYTES_32')) ||
-            
-            // Mempool格式 
-            (out['ScriptPubKey (HEX)']?.startsWith('5120')) ||
-            (out['ScriptPubKey (ASM)']?.includes('OP_PUSHNUM_1')) ||
-            (out.type === 'V1_P2TR');
-            
-          // 检查是否是标准粉尘值: 0.00000546 BTC - 允许稍微宽松的比较
-          let isDust = false;
-          // 三种可能的值表示: 浮点数、字符串和直接显示
-          if (typeof out.value === 'number') {
-            isDust = Math.abs(out.value - 0.00000546) < 0.00000001;
-          } else if (typeof out.value === 'string' && out.value.includes('0.00000546')) {
-            isDust = true;
-          } else if (out['‎0.00000546 BTC'] !== undefined) {
-            isDust = true;
-          }
-          
-          return isP2TR && isDust;
-        });
-      }
-      
-      // 记录是否有P2TR粉尘输出
-      if (isSampleTx) {
-        logger.info(`交易${txid}是否有P2TR粉尘输出: ${hasP2TRDust}`);
-      }
-      
-      // 逐个检查OP_RETURN输出
-      for (const output of opReturnOutputs) {
-        // 收集所有可能的数据表示
-        const hexData = 
-          output.scriptPubKey?.hex || 
-          output.scriptpubkey || 
-          output['ScriptPubKey (HEX)'] || 
-          '';
-          
-        const asmData = 
-          output.scriptPubKey?.asm || 
-          output.scriptpubkey_asm || 
-          output['ScriptPubKey (ASM)'] || 
-          '';
+
+      // 查找OP_RETURN输出
+      const opReturnOutput = tx.vout.find(vout => {
+        // 获取scriptPubKey的hex数据
+        const hexData = vout.scriptPubKey?.hex || vout.scriptpubkey || '';
         
-        // 如果是示例交易，打印完整数据
-        if (isSampleTx) {
-          logger.info(`OP_RETURN数据: HEX=${hexData}, ASM=${asmData}`);
-        }
-        
-        // 铸造特征1: 包含ff7f81序列 - Alkanes协议标识
-        if (hexData.includes('ff7f81')) {
-          // 如果同时有P2TR粉尘输出或者是示例交易，几乎可以确定是DIESEL铸造
-          if (hasP2TRDust || isSampleTx) {
-            logger.info(`[高可信] 找到DIESEL铸造交易: ${txid}`);
-            return true;
+        // 检查输出类型是否为OP_RETURN
+        const isOpReturn = (
+          vout.scriptPubKey?.type === 'nulldata' ||
+          vout.scriptpubkey_type === 'op_return' ||
+          hexData.startsWith('6a') // OP_RETURN的操作码是0x6a
+        );
+
+        if (config.debug.enabled) {
+          if (isOpReturn) {
+            logger.debug(`找到OP_RETURN输出，hex数据: ${hexData}`);
           }
         }
-        
-        // 铸造特征2: 用户示例中的特定数据模式
-        if (hexData.includes('ff7f818cec82d08bc0a88281d215')) {
-          logger.info(`[精确匹配] 找到DIESEL铸造交易: ${txid}`);
-          return true;
+
+        // 检查是否包含DIESEL特征序列
+        const containsDieselPattern = hexData.includes('ff7f818cec82d08bc0a88281d215');
+
+        return isOpReturn && containsDieselPattern;
+      });
+
+      if (opReturnOutput) {
+        if (config.debug.enabled) {
+          logger.info(`确认DIESEL铸造交易: ${txid}`);
+          // 输出完整的OP_RETURN数据以便调试
+          logger.debug(`OP_RETURN数据: ${JSON.stringify(opReturnOutput, null, 2)}`);
         }
-        
-        // 铸造特征3: 6a5d0e格式的OP_RETURN (OP_RETURN OP_PUSHNUM_13)
-        if (hexData.startsWith('6a5d0e') || hexData.includes('6a5d0e')) {
-          logger.info(`[格式匹配] 找到DIESEL铸造交易: ${txid}`);
-          return true;
-        }
-        
-        // 铸造特征4: ASM格式包含特定模式
-        if (asmData.includes('OP_RETURN OP_PUSHNUM_13') || 
-            asmData.includes('OP_RETURN 13') ||
-            asmData.includes('OP_PUSHBYTES_14 ff7f81')) {
-          logger.info(`[ASM匹配] 找到DIESEL铸造交易: ${txid}`);
-          return true;
-        }
-        
-        // 铸造特征5: 更宽松的hex检查
-        if (hexData) {
-          try {
-            // 实例5.1: 任何6a开头且后面有5d (OP_PUSHNUM_13)的数据
-            if (hexData.startsWith('6a') && (hexData.includes('5d') || hexData.includes('0e'))) {
-              logger.info(`[宽松匹配] 找到可能的DIESEL铸造交易: ${txid}`);
-              // 如果同时有P2TR粉尘输出，更有可能是DIESEL铸造
-              if (hasP2TRDust) {
-                return true;
-              }
-            }
-          } catch (error) {
-            // 解析错误，忽略
-          }
-        }
+        return true;
       }
-      
-      // 最后尝试降低门槛识别
-      if (hasP2TRDust && opReturnOutputs.length > 0) {
-        const txDetails = `txid=${txid}`;
-        logger.debug(`[结构匹配] 发现具有P2TR粉尘+OP_RETURN的交易: ${txDetails}`);
-        
-        // 将此行注释掉可以降低误报，取消注释可以增加查全率
-        // return true;
-      }
-      
-      // 所有检查都未通过，不是DIESEL铸造交易
+
       return false;
     } catch (error) {
       logger.error(`检查DIESEL铸造交易失败: ${error.message}`);
@@ -873,24 +794,109 @@ class DieselMonitor extends EventEmitter {
    * @returns {Object} - 最高Gas费率信息
    */
   getMempoolHighestGasRate() {
-    let highestRate = 0;
-    let highestTx = null;
-    
-    for (const [txid, info] of this.pendingMintTransactions.entries()) {
-      // 忽略费率为0或极低的交易(可能是数据错误)
-      if (info.feeRate > 1 && info.feeRate > highestRate) {
-        highestRate = info.feeRate;
-        highestTx = {
-          txid,
-          feeRate: info.feeRate,
-          sender: info.sender,
-          timestamp: info.timestamp
-        };
-      }
+    return this.highestGasRate;
+  }
+
+  /**
+   * 更新最高费率记录
+   * @param {string} txid - 交易ID
+   * @param {number} feeRate - 费率
+   * @param {string} sender - 发送者地址
+   * @returns {boolean} - 是否更新了最高费率
+   */
+  updateHighestGasRate(txid, feeRate, sender) {
+    if (feeRate > this.highestGasRate.feeRate) {
+      this.highestGasRate = {
+        txid,
+        feeRate,
+        sender,
+        timestamp: Date.now()
+      };
+      logger.info(`更新最高Gas费率记录: ${feeRate.toFixed(2)} sat/vB, 交易: ${txid}`);
+      return true;
     }
-    
-    // 如果没有找到有效费率的交易，返回null而不是费率为0的交易
-    return highestTx;
+    return false;
+  }
+
+  /**
+   * 分析指定区块
+   * @param {number} height - 区块高度
+   */
+  async analyzeSpecificBlock(height) {
+    try {
+      logger.info(`开始分析区块 #${height}`);
+      
+      const blockHash = await bitcoinRPC.getBlockHash(height);
+      const block = await bitcoinRPC.getBlock(blockHash, 2); // 详细级别2获取完整交易
+      
+      logger.info(`区块 #${height} 包含 ${block.tx.length} 笔交易`);
+
+      // 存储当前区块中的DIESEL铸造交易
+      const blockDieselMints = [];
+      let highestFeeRateInBlock = 0;
+      let highestFeeTxid = null;
+      
+      // 处理区块中的所有交易
+      for (const tx of block.tx) {
+        // 检查是否是DIESEL铸造交易
+        const isDieselMint = this.isDieselMintTransaction(tx);
+        
+        if (isDieselMint) {
+          // 计算交易的fee rate (sat/vB)
+          const feeRate = this.calculateFeeRate(tx);
+          
+          // 如果费率计算失败，跳过这笔交易
+          if (feeRate === null) {
+            logger.info(`发现DIESEL铸造交易: ${tx.txid} 在区块 #${height}, 费率: 无效`);
+            continue;
+          }
+          
+          // 保存交易信息
+          const mintInfo = {
+            txid: tx.txid,
+            blockHeight: height,
+            blockTime: block.time,
+            feeRate: feeRate,
+            sender: this.extractSender(tx),
+            timestamp: Date.now()
+          };
+          
+          blockDieselMints.push(mintInfo);
+          
+          // 更新该区块中最高gas费率的交易
+          if (feeRate > highestFeeRateInBlock) {
+            highestFeeRateInBlock = feeRate;
+            highestFeeTxid = tx.txid;
+          }
+          
+          logger.info(`发现DIESEL铸造交易: ${tx.txid}, 费率: ${feeRate.toFixed(2)} sat/vB`);
+        }
+      }
+      
+      // 输出分析结果
+      if (blockDieselMints.length > 0) {
+        logger.info(`\n区块 #${height} 分析结果:`);
+        logger.info(`- 发现 ${blockDieselMints.length} 笔DIESEL铸造交易`);
+        logger.info(`- 最高费率: ${highestFeeRateInBlock.toFixed(2)} sat/vB`);
+        logger.info(`- 最高费率交易: ${highestFeeTxid}`);
+        
+        // 按费率排序输出所有铸造交易
+        blockDieselMints.sort((a, b) => b.feeRate - a.feeRate);
+        logger.info('\n所有DIESEL铸造交易(按费率排序):');
+        blockDieselMints.forEach((mint, index) => {
+          logger.info(`${index + 1}. ${mint.txid} - ${mint.feeRate.toFixed(2)} sat/vB`);
+        });
+      } else {
+        logger.info(`区块 #${height} 中没有发现DIESEL铸造交易`);
+      }
+      
+      // 分析完成后退出
+      process.exit(0);
+      
+    } catch (error) {
+      logger.error(`分析区块 #${height} 失败: ${error.message}`);
+      process.exit(1);
+    }
   }
 }
 
