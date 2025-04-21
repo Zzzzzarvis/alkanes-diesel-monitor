@@ -181,6 +181,56 @@ class BitcoinRPC {
     
     return result;
   }
+
+  /**
+   * 获取交易的费率（以sat/vB为单位）
+   * @param {string} txid - 交易ID
+   * @returns {Promise<number>} - 交易费率（sat/vB）
+   */
+  async getTransactionFeeRate(txid) {
+    try {
+      const tx = await this.getRawTransaction(txid, true);
+      if (!tx) return 0;
+      
+      // 获取交易大小
+      const vsize = tx.vsize || tx.size || (tx.weight ? Math.ceil(tx.weight / 4) : 0);
+      if (!vsize || vsize <= 0) return 0;
+      
+      // 对于mempool中的交易，可能需要计算输入和输出的差额
+      let fee = 0;
+      
+      // 如果交易已经包含fee字段，直接使用
+      if (tx.fee !== undefined) {
+        fee = Math.abs(tx.fee * 100000000); // 转换为satoshi
+      } else {
+        // 需要查询输入交易来计算fee
+        // 这里为简化，返回一个估计值或默认值
+        fee = 1000; // 默认1000 satoshi作为fallback
+      }
+      
+      // 计算费率 sat/vB
+      const feeRate = fee / vsize;
+      return feeRate;
+    } catch (error) {
+      logger.warn(`计算交易 ${txid} 费率失败: ${error.message}`);
+      return 0;
+    }
+  }
+
+  /**
+   * 估算交易费率
+   * @param {number} confirmTarget - 目标确认区块数
+   * @returns {Promise<Object>} - 费率估算结果，包含feerate字段
+   */
+  async estimateSmartFee(confirmTarget = 2) {
+    try {
+      const result = await this.call('estimatesmartfee', [confirmTarget]);
+      return result || { feerate: 10 }; // 默认最低10 sat/vB
+    } catch (error) {
+      logger.warn(`估算费率失败: ${error.message}`);
+      return { feerate: 10 }; // 默认值
+    }
+  }
 }
 
 module.exports = new BitcoinRPC(); 

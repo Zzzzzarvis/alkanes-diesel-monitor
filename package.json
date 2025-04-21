@@ -5,7 +5,9 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "nodemon src/index.js"
+    "dev": "nodemon src/index.js",
+    "test": "jest",
+    "diesel": "node src/cli/monitorDiesel.js"
   },
   "dependencies": {
     "axios": "^1.6.2",
