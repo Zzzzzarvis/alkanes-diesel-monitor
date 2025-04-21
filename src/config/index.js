@@ -1,6 +1,24 @@
 require('dotenv').config();
 
+// 解析命令行参数
+const argv = require('minimist')(process.argv.slice(2));
+
 module.exports = {
+  // 调试配置
+  debug: {
+    enabled: argv['debug'] || false,
+    logLevel: argv['log-level'] || 'info',
+    showDetails: argv['show-details'] || false,
+    traceApi: argv['trace-api'] || false,
+    mempool: argv['debug-mempool'] || false
+  },
+  // 区块分析配置
+  blockAnalysis: {
+    // 指定要分析的区块高度，如果为null则分析最新区块
+    targetHeight: argv['block-height'] ? parseInt(argv['block-height']) : null,
+    // 是否只分析指定区块
+    analyzeOnly: argv['analyze-only'] || false
+  },
   btcNode: {
     url: process.env.BTC_RPC_URL || 'http://101.43.19.118:8332',
     user: process.env.BTC_RPC_USER || 'bitcoinrpc',
