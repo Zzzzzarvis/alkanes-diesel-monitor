@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DIESEL铸造监控</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body {
+      padding-top: 20px;
+      background-color: #f8f9fa;
+    }
+    .card {
+      margin-bottom: 20px;
+      box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    }
+    .header-card {
+      background: linear-gradient(135deg, #ff5e62 0%, #ff9966 100%);
+      color: white;
+    }
+    .mint-event {
+      transition: all 0.3s ease;
+      border-left: 4px solid transparent;
+    }
+    .mint-event:hover {
+      border-left: 4px solid #ff5e62;
+      background-color: #f8f9fa;
+    }
+    .mint-event.new {
+      animation: highlight 2s ease;
+    }
+    .status-badge {
+      font-size: 0.9rem;
+      padding: 0.3rem 0.6rem;
+    }
+    .txid {
+      word-break: break-all;
+      font-family: monospace;
+      font-size: 0.9rem;
+    }
+    .height-badge {
+      background-color: #ff5e62;
+      color: white;
+    }
+    .loading-spinner {
+      margin: 50px auto;
+      text-align: center;
+    }
+    .gas-info {
+      font-size: 1.2rem;
+      font-weight: bold;
+    }
+    .mempool-info {
+      background-color: #f7f8fa;
+      border-left: 4px solid #ff9966;
+    }
+    @keyframes highlight {
+      0% { background-color: rgba(255, 94, 98, 0.2); }
+      100% { background-color: transparent; }
+    }
+    .winner-badge {
+      background-color: #28a745;
+      color: white;
+      font-weight: bold;
+    }
+    .fee-rate {
+      font-weight: bold;
+      color: #ff5e62;
+    }
+    .nav-pills .nav-link.active {
+      background-color: #ff5e62;
+    }
+    .mempool-card {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card header-card">
+      <div class="card-body">
+        <div class="row">
+          <div class="col-md-8">
+            <h1 class="card-title">DIESEL 铸造监控</h1>
+            <p class="card-text">实时监控DIESEL铸造交易的Gas费用情况</p>
+          </div>
+          <div class="col-md-4 text-end">
+            <div class="mb-2">
+              <span class="status-badge badge bg-success" id="status-badge">运行中</span>
+              <span class="badge height-badge" id="block-height">区块高度: 加载中...</span>
+            </div>
+            <div class="btn-group" role="group">
+              <button id="startBtn" class="btn btn-light btn-sm">启动监控</button>
+              <button id="stopBtn" class="btn btn-light btn-sm">停止监控</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="row">
+      <!-- 最高Gas费用信息 -->
+      <div class="col-md-6">
+        <div class="card">
+          <div class="card-header">
+            <h5 class="mb-0">历史最高Gas费率</h5>
+          </div>
+          <div class="card-body">
+            <div id="highest-gas-info">
+              <p class="gas-info">加载中...</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Mempool最高Gas费用信息 -->
+      <div class="col-md-6">
+        <div class="card mempool-card">
+          <div class="card-header">
+            <h5 class="mb-0">Mempool最高Gas费率</h5>
+          </div>
+          <div class="card-body">
+            <div id="mempool-highest-gas">
+              <p class="gas-info">加载中...</p>
+            </div>
+            <p class="small mb-0" id="mempool-count"></p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 铸造交易记录 -->
+    <div class="card">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <ul class="nav nav-pills" id="txTabs" role="tablist">
+          <li class="nav-item" role="presentation">
+            <button class="nav-link active" id="confirmed-tab" data-bs-toggle="tab" data-bs-target="#confirmed" type="button" role="tab" aria-selected="true">确认铸造交易</button>
+          </li>
+          <li class="nav-item" role="presentation">
+            <button class="nav-link" id="mempool-tab" data-bs-toggle="tab" data-bs-target="#mempool" type="button" role="tab" aria-selected="false">Mempool铸造交易</button>
+          </li>
+        </ul>
+        <span class="badge bg-primary" id="events-counter">0</span>
+      </div>
+      <div class="card-body p-0">
+        <div class="tab-content" id="txTabContent">
+          <!-- 确认交易标签页 -->
+          <div class="tab-pane fade show active" id="confirmed" role="tabpanel" aria-labelledby="confirmed-tab">
+            <div id="loading" class="loading-spinner">
+              <div class="spinner-border text-primary" role="status">
+                <span class="visually-hidden">Loading...</span>
+              </div>
+              <p class="mt-2">加载数据中...</p>
+            </div>
+            <div id="noEvents" class="p-4 text-center" style="display: none;">
+              <p class="text-muted">暂无铸造交易</p>
+            </div>
+            <div class="list-group list-group-flush" id="mintEventsList"></div>
+          </div>
+          
+          <!-- Mempool交易标签页 -->
+          <div class="tab-pane fade" id="mempool" role="tabpanel" aria-labelledby="mempool-tab">
+            <div id="mempoolLoading" class="loading-spinner">
+              <div class="spinner-border text-primary" role="status">
+                <span class="visually-hidden">Loading...</span>
+              </div>
+              <p class="mt-2">加载数据中...</p>
+            </div>
+            <div id="noMempoolEvents" class="p-4 text-center" style="display: none;">
+              <p class="text-muted">Mempool中暂无铸造交易</p>
+            </div>
+            <div class="list-group list-group-flush" id="mempoolEventsList"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- 导航链接 -->
+    <div class="text-center mb-4">
+      <a href="/" class="btn btn-outline-secondary">返回主页</a>
+    </div>
+  </div>
+
+  <!-- 交易详情模态框 -->
+  <div class="modal fade" id="txDetailModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">交易详情</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body" id="modalBody">
+          <!-- 详情将在这里动态添加 -->
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- JavaScript 库 -->
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    // 连接Socket.IO
+    const socket = io();
+    
+    // DOM元素
+    const mintEventsList = document.getElementById('mintEventsList');
+    const mempoolEventsList = document.getElementById('mempoolEventsList');
+    const statusBadge = document.getElementById('status-badge');
+    const blockHeight = document.getElementById('block-height');
+    const eventsCounter = document.getElementById('events-counter');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const loading = document.getElementById('loading');
+    const mempoolLoading = document.getElementById('mempoolLoading');
+    const noEvents = document.getElementById('noEvents');
+    const noMempoolEvents = document.getElementById('noMempoolEvents');
+    const highestGasInfo = document.getElementById('highest-gas-info');
+    const mempoolHighestGas = document.getElementById('mempool-highest-gas');
+    const mempoolCount = document.getElementById('mempool-count');
+    const txDetailModal = new bootstrap.Modal(document.getElementById('txDetailModal'));
+    const modalBody = document.getElementById('modalBody');
+    
+    // 存储铸造交易数据
+    let mintEvents = [];
+    let mempoolEvents = [];
+    let highestGas = null;
+    let mempoolHighestGasInfo = null;
+    
+    // 控制按钮事件
+    startBtn.addEventListener('click', () => {
+      socket.emit('control', 'start-diesel');
+    });
+    
+    stopBtn.addEventListener('click', () => {
+      socket.emit('control', 'stop-diesel');
+    });
+    
+    // 更新状态UI
+    function updateStatusUI(status, height) {
+      blockHeight.textContent = `区块高度: ${height || '未知'}`;
+      
+      if (status === 'running') {
+        statusBadge.textContent = '运行中';
+        statusBadge.className = 'status-badge badge bg-success';
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+      } else {
+        statusBadge.textContent = '已停止';
+        statusBadge.className = 'status-badge badge bg-danger';
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+      }
+    }
+    
+    // 更新最高Gas费率信息
+    function updateHighestGasInfo(info) {
+      if (!info || !info.txid) {
+        highestGasInfo.innerHTML = '<p class="text-muted">暂无数据</p>';
+        return;
+      }
+      
+      const timeString = info.timestamp ? new Date(info.timestamp).toLocaleString('zh-CN') : '未知';
+      
+      highestGasInfo.innerHTML = `
+        <p class="gas-info">${info.feeRate.toFixed(2)} sat/vB</p>
+        <p>交易ID: <span class="txid">${info.txid.substring(0, 12)}...</span></p>
+        <p>区块高度: ${info.blockHeight || '未知'}</p>
+        <p>时间: ${timeString}</p>
+      `;
+    }
+    
+    // 更新Mempool最高Gas费率信息
+    function updateMempoolHighestGas(info) {
+      if (!info || !info.txid) {
+        mempoolHighestGas.innerHTML = '<p class="text-muted">暂无数据</p>';
+        return;
+      }
+      
+      const timeString = info.timestamp ? new Date(info.timestamp).toLocaleString('zh-CN') : '未知';
+      
+      mempoolHighestGas.innerHTML = `
+        <p class="gas-info">${info.feeRate.toFixed(2)} sat/vB</p>
+        <p>交易ID: <span class="txid">${info.txid.substring(0, 12)}...</span></p>
+        <p>发送者: ${info.sender || '未知'}</p>
+        <p>时间: ${timeString}</p>
+      `;
+    }
+    
+    // 更新Mempool计数
+    function updateMempoolCount(count) {
+      if (!count) {
+        mempoolCount.textContent = '';
+        return;
+      }
+      
+      mempoolCount.textContent = `Mempool中共有 ${count} 笔DIESEL铸造交易`;
+    }
+    
+    // 创建铸造交易列表项
+    function createMintEventItem(event, isNew = false, isWinner = false) {
+      const item = document.createElement('a');
+      item.href = '#';
+      item.className = `list-group-item list-group-item-action mint-event ${isNew ? 'new' : ''}`;
+      item.setAttribute('data-txid', event.txid);
+      
+      const timeString = event.blockTime 
+        ? new Date(event.blockTime * 1000).toLocaleString('zh-CN')
+        : new Date(event.timestamp).toLocaleString('zh-CN');
+      
+      item.innerHTML = `
+        <div class="d-flex w-100 justify-content-between">
+          <h6 class="mb-1">交易ID: <span class="txid">${event.txid.substring(0, 16)}...</span></h6>
+          <small>
+            ${event.blockHeight ? `<span class="badge bg-secondary">区块 #${event.blockHeight}</span>` : ''}
+            <span class="badge bg-info">${timeString}</span>
+            ${isWinner ? '<span class="badge winner-badge">赢家</span>' : ''}
+          </small>
+        </div>
+        <p class="mb-1">发送者: ${event.sender || '未知'}</p>
+        <p class="mb-1">Gas费率: <span class="fee-rate">${event.feeRate.toFixed(2)} sat/vB</span></p>
+      `;
+      
+      item.addEventListener('click', (e) => {
+        e.preventDefault();
+        showTxDetails(event);
+      });
+      
+      return item;
+    }
+    
+    // 创建Mempool交易列表项
+    function createMempoolEventItem(event, isNew = false) {
+      const item = document.createElement('a');
+      item.href = '#';
+      item.className = `list-group-item list-group-item-action mint-event mempool-info ${isNew ? 'new' : ''}`;
+      item.setAttribute('data-txid', event.txid);
+      
+      const timeString = new Date(event.timestamp).toLocaleString('zh-CN');
+      
+      item.innerHTML = `
+        <div class="d-flex w-100 justify-content-between">
+          <h6 class="mb-1">交易ID: <span class="txid">${event.txid.substring(0, 16)}...</span></h6>
+          <small>
+            <span class="badge bg-warning text-dark">Mempool</span>
+            <span class="badge bg-info">${timeString}</span>
+          </small>
+        </div>
+        <p class="mb-1">发送者: ${event.sender || '未知'}</p>
+        <p class="mb-1">Gas费率: <span class="fee-rate">${event.feeRate.toFixed(2)} sat/vB</span></p>
+      `;
+      
+      item.addEventListener('click', (e) => {
+        e.preventDefault();
+        showTxDetails(event);
+      });
+      
+      return item;
+    }
+    
+    // 显示交易详情
+    function showTxDetails(tx) {
+      const timeString = tx.blockTime 
+        ? new Date(tx.blockTime * 1000).toLocaleString('zh-CN')
+        : new Date(tx.timestamp).toLocaleString('zh-CN');
+      
+      modalBody.innerHTML = `
+        <div class="card mb-3">
+          <div class="card-header">基本信息</div>
+          <div class="card-body">
+            <p><strong>交易ID:</strong> <span class="txid">${tx.txid}</span></p>
+            ${tx.blockHeight ? `<p><strong>区块高度:</strong> ${tx.blockHeight}</p>` : ''}
+            <p><strong>时间:</strong> ${timeString}</p>
+            <p><strong>发送者:</strong> ${tx.sender || '未知'}</p>
+            <p><strong>Gas费率:</strong> <span class="fee-rate">${tx.feeRate.toFixed(2)} sat/vB</span></p>
+            ${tx.inMempool ? '<p><strong>状态:</strong> <span class="badge bg-warning text-dark">Mempool中</span></p>' : ''}
+          </div>
+        </div>
+      `;
+      
+      txDetailModal.show();
+    }
+    
+    // 更新铸造交易列表
+    function updateMintEventsList() {
+      mintEventsList.innerHTML = '';
+      loading.style.display = 'none';
+      
+      if (mintEvents.length === 0) {
+        noEvents.style.display = 'block';
+        return;
+      }
+      
+      noEvents.style.display = 'none';
+      
+      // 按区块高度降序排序
+      mintEvents.sort((a, b) => 
+        b.blockHeight - a.blockHeight || 
+        b.feeRate - a.feeRate
+      );
+      
+      mintEvents.forEach(event => {
+        // 判断是否是赢家（每个区块中第一个）
+        const isWinner = mintEvents.filter(e => 
+          e.blockHeight === event.blockHeight
+        )[0].txid === event.txid;
+        
+        const item = createMintEventItem(event, false, isWinner);
+        mintEventsList.appendChild(item);
+      });
+      
+      eventsCounter.textContent = mintEvents.length;
+    }
+    
+    // 更新Mempool铸造交易列表
+    function updateMempoolEventsList() {
+      mempoolEventsList.innerHTML = '';
+      mempoolLoading.style.display = 'none';
+      
+      if (mempoolEvents.length === 0) {
+        noMempoolEvents.style.display = 'block';
+        return;
+      }
+      
+      noMempoolEvents.style.display = 'none';
+      
+      // 按费率降序排序
+      mempoolEvents.sort((a, b) => b.feeRate - a.feeRate);
+      
+      mempoolEvents.forEach(event => {
+        const item = createMempoolEventItem(event);
+        mempoolEventsList.appendChild(item);
+      });
+    }
+    
+    // Socket.IO事件监听
+    socket.on('init', (data) => {
+      updateStatusUI(data.dieselStatus, data.currentBlockHeight);
+      mintEvents = data.dieselMintEvents || [];
+      updateMintEventsList();
+      
+      highestGas = data.dieselHighestGas;
+      updateHighestGasInfo(highestGas);
+      
+      mempoolHighestGasInfo = data.dieselMempoolHighestGas;
+      updateMempoolHighestGas(mempoolHighestGasInfo);
+    });
+    
+    socket.on('status', (data) => {
+      updateStatusUI(data.dieselStatus, data.currentBlockHeight);
+    });
+    
+    // 监听新的DIESEL铸造交易
+    socket.on('diesel-mint', (event) => {
+      // 避免重复
+      const existingIndex = mintEvents.findIndex(e => e.txid === event.txid);
+      if (existingIndex !== -1) {
+        mintEvents[existingIndex] = event;
+      } else {
+        mintEvents.push(event);
+        
+        // 添加到列表顶部
+        const isWinner = true; // 新加入的铸造交易通常是区块中的赢家
+        const item = createMintEventItem(event, true, isWinner);
+        if (mintEventsList.firstChild) {
+          mintEventsList.insertBefore(item, mintEventsList.firstChild);
+        } else {
+          mintEventsList.appendChild(item);
+          noEvents.style.display = 'none';
+        }
+        
+        eventsCounter.textContent = mintEvents.length;
+      }
+    });
+    
+    // 监听最高Gas费率更新
+    socket.on('diesel-highest-gas', (info) => {
+      highestGas = info;
+      updateHighestGasInfo(info);
+    });
+    
+    // 监听Mempool更新
+    socket.on('diesel-mempool', (info) => {
+      updateMempoolCount(info.count);
+      
+      if (info.highestFeeRate > 0) {
+        const highestGasInfo = {
+          txid: info.highestFeeTxid,
+          feeRate: info.highestFeeRate,
+          timestamp: Date.now()
+        };
+        
+        mempoolHighestGasInfo = highestGasInfo;
+        updateMempoolHighestGas(highestGasInfo);
+      }
+    });
+    
+    // 处理Mempool中的铸造交易
+    socket.on('diesel-mempool-tx', (tx) => {
+      // 避免重复
+      const existingIndex = mempoolEvents.findIndex(e => e.txid === tx.txid);
+      if (existingIndex !== -1) {
+        mempoolEvents[existingIndex] = tx;
+      } else {
+        mempoolEvents.push(tx);
+        
+        // 添加到列表顶部
+        const item = createMempoolEventItem(tx, true);
+        if (mempoolEventsList.firstChild) {
+          mempoolEventsList.insertBefore(item, mempoolEventsList.firstChild);
+        } else {
+          mempoolEventsList.appendChild(item);
+          noMempoolEvents.style.display = 'none';
+        }
+      }
+      
+      updateMempoolEventsList();
+    });
+    
+    // 监听赢得DIESEL的交易
+    socket.on('diesel-won', (tx) => {
+      // 显示通知
+      if (Notification.permission === 'granted') {
+        new Notification('DIESEL铸造成功', {
+          body: `区块#${tx.blockHeight}中的交易${tx.txid.substring(0, 8)}...赢得了DIESEL，费率: ${tx.feeRate.toFixed(2)} sat/vB`,
+          icon: '/favicon.ico'
+        });
+      }
+      
+      // 移除该交易从mempool列表
+      const mempoolIndex = mempoolEvents.findIndex(e => e.txid === tx.txid);
+      if (mempoolIndex !== -1) {
+        mempoolEvents.splice(mempoolIndex, 1);
+        updateMempoolEventsList();
+      }
+    });
+    
+    // 连接断开时
+    socket.on('disconnect', () => {
+      statusBadge.textContent = '已断开';
+      statusBadge.className = 'status-badge badge bg-warning';
+      startBtn.disabled = true;
+      stopBtn.disabled = true;
+    });
+    
+    // 页面加载完成后，请求通知权限
+    document.addEventListener('DOMContentLoaded', () => {
+      if (Notification.permission !== 'granted' && Notification.permission !== 'denied') {
+        Notification.requestPermission();
+      }
+      
+      // 请求初始数据
+      fetch('/api/diesel/mint-events')
+        .then(response => response.json())
+        .then(data => {
+          mintEvents = data;
+          updateMintEventsList();
+        });
+      
+      fetch('/api/diesel/mempool')
+        .then(response => response.json())
+        .then(data => {
+          mempoolEvents = data.transactions || [];
+          updateMempoolEventsList();
+          
+          if (data.highestGas) {
+            mempoolHighestGasInfo = data.highestGas;
+            updateMempoolHighestGas(data.highestGas);
+          }
+        });
+    });
+  </script>
+</body>
+</html> 

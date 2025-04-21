@@ -1,0 +1,20 @@
+{
+  "name": "alkanes-monitor",
+  "version": "1.0.0",
+  "description": "监控Bitcoin主网上的Alkanes协议铸造活动",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.2",
+    "express": "^4.18.2",
+    "socket.io": "^4.7.2",
+    "winston": "^3.11.0",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+} 

@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Alkanes协议监控</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body {
+      padding-top: 20px;
+      background-color: #f8f9fa;
+    }
+    .card {
+      margin-bottom: 20px;
+      box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    }
+    .header-card {
+      background: linear-gradient(135deg, #6e45e2 0%, #88d3ce 100%);
+      color: white;
+    }
+    .mint-event {
+      transition: all 0.3s ease;
+      border-left: 4px solid transparent;
+    }
+    .mint-event:hover {
+      border-left: 4px solid #6e45e2;
+      background-color: #f8f9fa;
+    }
+    .mint-event.new {
+      animation: highlight 2s ease;
+    }
+    .status-badge {
+      font-size: 0.9rem;
+      padding: 0.3rem 0.6rem;
+    }
+    .txid {
+      word-break: break-all;
+      font-family: monospace;
+      font-size: 0.9rem;
+    }
+    .height-badge {
+      background-color: #6e45e2;
+      color: white;
+    }
+    .loading-spinner {
+      margin: 50px auto;
+      text-align: center;
+    }
+    @keyframes highlight {
+      0% { background-color: rgba(110, 69, 226, 0.2); }
+      100% { background-color: transparent; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card header-card">
+      <div class="card-body">
+        <div class="row">
+          <div class="col-md-8">
+            <h1 class="card-title">Alkanes 协议监控</h1>
+            <p class="card-text">实时监控 Alkanes 协议在 Bitcoin 网络上的铸造活动</p>
+          </div>
+          <div class="col-md-4 text-end">
+            <div class="mb-2">
+              <span class="status-badge badge bg-success" id="status-badge">运行中</span>
+              <span class="badge height-badge" id="block-height">区块高度: 加载中...</span>
+            </div>
+            <div class="btn-group" role="group">
+              <button id="startBtn" class="btn btn-light btn-sm">启动监控</button>
+              <button id="stopBtn" class="btn btn-light btn-sm">停止监控</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="col-md-12">
+        <div class="card">
+          <div class="card-header d-flex justify-content-between align-items-center">
+            <h5 class="mb-0">铸造事件</h5>
+            <span class="badge bg-primary" id="events-counter">0</span>
+          </div>
+          <div class="card-body p-0">
+            <div id="loading" class="loading-spinner">
+              <div class="spinner-border text-primary" role="status">
+                <span class="visually-hidden">Loading...</span>
+              </div>
+              <p class="mt-2">加载数据中...</p>
+            </div>
+            <div id="noEvents" class="p-4 text-center" style="display: none;">
+              <p class="text-muted">暂无铸造事件</p>
+            </div>
+            <div class="list-group list-group-flush" id="mintEventsList">
+              <!-- 铸造事件将在这里动态添加 -->
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 铸造事件详情模态框 -->
+  <div class="modal fade" id="eventDetailModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">铸造事件详情</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body" id="modalBody">
+          <!-- 详情将在这里动态添加 -->
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- JavaScript 库 -->
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    // 连接Socket.IO
+    const socket = io();
+    
+    // DOM元素
+    const mintEventsList = document.getElementById('mintEventsList');
+    const statusBadge = document.getElementById('status-badge');
+    const blockHeight = document.getElementById('block-height');
+    const eventsCounter = document.getElementById('events-counter');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const loading = document.getElementById('loading');
+    const noEvents = document.getElementById('noEvents');
+    const eventDetailModal = new bootstrap.Modal(document.getElementById('eventDetailModal'));
+    const modalBody = document.getElementById('modalBody');
+    
+    // 存储铸造事件
+    let mintEvents = [];
+    
+    // 控制按钮事件
+    startBtn.addEventListener('click', () => {
+      socket.emit('control', 'start');
+    });
+    
+    stopBtn.addEventListener('click', () => {
+      socket.emit('control', 'stop');
+    });
+    
+    // 更新状态UI
+    function updateStatusUI(status, height) {
+      blockHeight.textContent = `区块高度: ${height || '未知'}`;
+      
+      if (status === 'running') {
+        statusBadge.textContent = '运行中';
+        statusBadge.className = 'status-badge badge bg-success';
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+      } else {
+        statusBadge.textContent = '已停止';
+        statusBadge.className = 'status-badge badge bg-danger';
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+      }
+    }
+    
+    // 创建铸造事件列表项
+    function createMintEventItem(event, isNew = false) {
+      const item = document.createElement('a');
+      item.href = '#';
+      item.className = `list-group-item list-group-item-action mint-event ${isNew ? 'new' : ''}`;
+      item.setAttribute('data-txid', event.txid);
+      
+      const timeString = new Date(event.blockTime).toLocaleString('zh-CN');
+      
+      item.innerHTML = `
+        <div class="d-flex w-100 justify-content-between">
+          <h6 class="mb-1">交易ID: <span class="txid">${event.txid.substring(0, 16)}...</span></h6>
+          <small>
+            <span class="badge bg-secondary">区块 #${event.blockHeight}</span>
+            <span class="badge bg-info">${timeString}</span>
+          </small>
+        </div>
+        <p class="mb-1">发送者: ${event.sender || '未知'}</p>
+      `;
+      
+      item.addEventListener('click', (e) => {
+        e.preventDefault();
+        showEventDetails(event);
+      });
+      
+      return item;
+    }
+    
+    // 显示事件详情
+    function showEventDetails(event) {
+      const timeString = new Date(event.blockTime).toLocaleString('zh-CN');
+      
+      modalBody.innerHTML = `
+        <div class="card mb-3">
+          <div class="card-header">基本信息</div>
+          <div class="card-body">
+            <p><strong>交易ID:</strong> <span class="txid">${event.txid}</span></p>
+            <p><strong>区块高度:</strong> ${event.blockHeight}</p>
+            <p><strong>区块时间:</strong> ${timeString}</p>
+            <p><strong>发送者:</strong> ${event.sender || '未知'}</p>
+          </div>
+        </div>
+        
+        <div class="card">
+          <div class="card-header">原始数据</div>
+          <div class="card-body">
+            <pre class="mb-0" style="font-size: 0.8rem; overflow-x: auto;">${JSON.stringify(event.data, null, 2)}</pre>
+          </div>
+        </div>
+      `;
+      
+      eventDetailModal.show();
+    }
+    
+    // 更新铸造事件列表
+    function updateMintEventsList() {
+      mintEventsList.innerHTML = '';
+      loading.style.display = 'none';
+      
+      if (mintEvents.length === 0) {
+        noEvents.style.display = 'block';
+        return;
+      }
+      
+      noEvents.style.display = 'none';
+      
+      // 按区块高度降序排序
+      mintEvents.sort((a, b) => b.blockHeight - a.blockHeight);
+      
+      mintEvents.forEach(event => {
+        const item = createMintEventItem(event);
+        mintEventsList.appendChild(item);
+      });
+      
+      eventsCounter.textContent = mintEvents.length;
+    }
+    
+    // Socket.IO事件监听
+    socket.on('init', (data) => {
+      updateStatusUI(data.status, data.currentBlockHeight);
+      mintEvents = data.mintEvents || [];
+      updateMintEventsList();
+    });
+    
+    socket.on('status', (data) => {
+      updateStatusUI(data.status, data.currentBlockHeight);
+    });
+    
+    socket.on('mint', (event) => {
+      // 避免重复
+      const existingIndex = mintEvents.findIndex(e => e.txid === event.txid);
+      if (existingIndex !== -1) {
+        mintEvents[existingIndex] = event;
+      } else {
+        mintEvents.push(event);
+        
+        // 添加到列表顶部
+        const item = createMintEventItem(event, true);
+        if (mintEventsList.firstChild) {
+          mintEventsList.insertBefore(item, mintEventsList.firstChild);
+        } else {
+          mintEventsList.appendChild(item);
+          noEvents.style.display = 'none';
+        }
+        
+        eventsCounter.textContent = mintEvents.length;
+      }
+    });
+    
+    // 连接断开时
+    socket.on('disconnect', () => {
+      statusBadge.textContent = '已断开';
+      statusBadge.className = 'status-badge badge bg-warning';
+      startBtn.disabled = true;
+      stopBtn.disabled = true;
+    });
+  </script>
+</body>
+</html> 
